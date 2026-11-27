@@ -1,0 +1,122 @@
+name: Build macOS Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch_label: arm64
+            asset_suffix: macos-arm64
+          - runner: macos-15-intel
+            arch_label: intel-x64
+            asset_suffix: macos-intel-x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source bundle if repository was bootstrapped via zip
+        shell: bash
+        run: |
+          if [ ! -f "pyproject.toml" ]; then
+            ZIP_FILE=$(ls -1 BirdGalleryStudio-*-source.zip 2>/dev/null | head -n 1 || true)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Extracting $ZIP_FILE ..."
+              unzip -q "$ZIP_FILE" -d _extracted_src
+              TOP_DIR=$(find _extracted_src -mindepth 1 -maxdepth 1 -type d | head -n 1)
+              cp -R "$TOP_DIR"/. .
+              rm -rf _extracted_src
+            fi
+          fi
+          ls -la
+
+      - name: Install uv and Python 3.12
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" python install 3.12
+          "$HOME/.local/bin/uv" sync --extra dev
+
+      - name: Run unit & GUI tests on macOS
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          uv run pytest -v
+
+      - name: Build BirdGalleryStudio.app via PyInstaller
+        shell: bash
+        run: |
+          uv run python scripts/build_exe.py
+
+      - name: Run smoke test on packaged BirdGalleryStudio.app
+        shell: bash
+        env:
+          QTWEBENGINE_CHROMIUM_FLAGS: "--no-sandbox --disable-gpu"
+        run: |
+          ./dist/BirdGalleryStudio.app/Contents/MacOS/BirdGalleryStudio \
+            --db build/smoke_mac.db \
+            --thumbs build/smoke_thumbs \
+            --smoke-test-out build/smoke_mac.txt
+          cat build/smoke_mac.txt
+          grep -q "SMOKE_OK" build/smoke_mac.txt
+          rm -rf build/smoke_mac.db* build/smoke_thumbs build/smoke_mac.txt
+
+      - name: Package macOS .zip and .dmg archives
+        shell: bash
+        run: |
+          mkdir -p releases stage_mac
+          cp -R dist/BirdGalleryStudio.app stage_mac/BirdGalleryStudio.app
+          cp README.md stage_mac/README.md
+          ln -s /Applications stage_mac/Applications
+
+          ZIP_NAME="BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.zip"
+          DMG_NAME="BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.dmg"
+
+          # Use macOS native ditto so Qt6 framework symlinks & signatures stay intact
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent dist/BirdGalleryStudio.app "releases/${ZIP_NAME}"
+          hdiutil create -volname "BirdGalleryStudio" -srcfolder stage_mac -ov -format UDZO "releases/${DMG_NAME}"
+
+          shasum -a 256 "releases/${ZIP_NAME}" > "releases/${ZIP_NAME}.sha256"
+          shasum -a 256 "releases/${DMG_NAME}" > "releases/${DMG_NAME}.sha256"
+          ls -lh releases/
+
+      - name: Upload macOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}
+          path: |
+            releases/BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.zip
+            releases/BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.dmg
+            releases/*.sha256
+
+      - name: Attach macOS archives to GitHub Release v1.0.0
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSETS=(
+            "releases/BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.zip"
+            "releases/BirdGalleryStudio-v1.0.0-${{ matrix.asset_suffix }}.dmg"
+          )
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0 "${ASSETS[@]}" --clobber
+          else
+            gh release create v1.0.0 "${ASSETS[@]}" \
+              --title "鸟羽集 · Bird Gallery Studio v1.0.0" \
+              --notes "鸟羽集 · Bird Gallery Studio v1.0.0（含 macOS 与 Windows 免安装发布包）" \
+            || gh release upload v1.0.0 "${ASSETS[@]}" --clobber
+          fi
